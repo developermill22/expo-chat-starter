@@ -1,0 +1,77 @@
+rules_version = '2';
+
+// Security rules for the chat starter. Deploy with:
+//   cd backend/firebase && npx firebase-tools deploy --only firestore
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    // Public profiles: any signed-in user can look people up to start a chat.
+    // Note this exposes email addresses to other signed-in users; drop the
+    // email field from the profile if that is not acceptable for your app.
+    match /users/{userId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && uid() == userId
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 2
+        && request.resource.data.displayName.size() <= 60
+        && request.resource.data.displayNameLower == request.resource.data.displayName.lower();
+      allow delete: if false;
+    }
+
+    match /conversations/{conversationId} {
+      function isMember(data) { return uid() in data.memberIds; }
+      function incoming() { return request.resource.data; }
+
+      // `resource == null` lets a client check whether a DM exists before creating it.
+      allow get: if signedIn() && (resource == null || isMember(resource.data));
+      allow list: if signedIn() && isMember(resource.data);
+
+      allow create: if signedIn()
+        && isMember(incoming())
+        && incoming().createdBy == uid()
+        && incoming().memberIds is list
+        && incoming().memberIds.size() >= 2
+        && incoming().memberIds.size() <= 50
+        && incoming().lastMessage == null
+        && incoming().updatedAt == request.time
+        && (
+          // Direct chat: exactly two members, sorted, and the id is derived from them.
+          (incoming().isGroup == false
+            && incoming().memberIds.size() == 2
+            && incoming().memberIds[0] < incoming().memberIds[1]
+            && conversationId == 'dm_' + incoming().memberIds[0] + '_' + incoming().memberIds[1])
+          ||
+          (incoming().isGroup == true
+            && incoming().title is string
+            && incoming().title.size() > 0
+            && incoming().title.size() <= 80)
+        );
+
+      // Members can only bump the preview when they send a message.
+      allow update: if signedIn() && isMember(resource.data)
+        && incoming().diff(resource.data).affectedKeys().hasOnly(['lastMessage', 'updatedAt'])
+        && incoming().updatedAt == request.time
+        && incoming().lastMessage.senderId == uid();
+
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        function parentMember() {
+          return uid() in get(/databases/$(database)/documents/conversations/$(conversationId)).data.memberIds;
+        }
+
+        allow read: if signedIn() && parentMember();
+        allow create: if signedIn() && parentMember()
+          && request.resource.data.keys().hasOnly(['senderId', 'text', 'clientId', 'createdAt'])
+          && request.resource.data.senderId == uid()
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 4000
+          && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+  }
+}
